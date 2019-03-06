@@ -15,25 +15,44 @@ use tiberius::*;
 /// A Microsoft SQL Server service implementation.
 ///
 /// See [`tower_service::Service`] for how to use this type.
-pub struct Tiberius<I: BoxableIo>(State<SqlConnection<I>>);
+pub struct Tiberius<I: BoxableIo>(Lease<SqlConnection<I>>);
 
 impl<I: BoxableIo> From<SqlConnection<I>> for Tiberius<I> {
     fn from(c: SqlConnection<I>) -> Self {
-        Tiberius(State::from(c))
+        Tiberius(Lease::from(c))
     }
 }
 
-struct State<S> {
+struct Lease<S> {
     inner: Arc<StateInner<S>>,
     permit: tokio_sync::semaphore::Permit,
 }
 
-impl<S> From<S> for State<S> {
+unsafe impl<S> Send for Lease<S> where S: Send + Sync {}
+
+impl<S> From<S> for Lease<S> {
     fn from(s: S) -> Self {
-        State {
+        Self {
             inner: Arc::new(StateInner::from(s)),
             permit: tokio_sync::semaphore::Permit::new(),
         }
+    }
+}
+
+impl<S> Lease<S> {
+    fn transfer(&mut self) -> Self {
+        assert!(self.permit.is_acquired());
+        Self {
+            inner: self.inner.clone(),
+            permit: std::mem::replace(&mut self.permit, tokio_sync::semaphore::Permit::new()),
+        }
+    }
+
+    fn restore(&mut self, state: S) {
+        assert!(self.permit.is_acquired());
+        unsafe { *self.inner.c.get() = Some(state) };
+        // finally, we can now release the permit since we're done with the connection
+        self.permit.release(&self.inner.s);
     }
 }
 
@@ -56,16 +75,14 @@ impl<S> From<S> for StateInner<S> {
 pub struct RestoringStateStream<S: StateStream> {
     first: Option<S::Item>,
     state: Option<S::State>,
-    inner: Arc<StateInner<S::State>>,
-    permit: tokio_sync::semaphore::Permit,
+    lease: Lease<S::State>,
     rest: S,
 }
 
 /// This is mainly a [`futures::Future`]; you should use it as such.
 // TODO: make this private using existentials.
 pub struct RestoringStateStreamFuture<S: StateStream> {
-    inner: Arc<StateInner<S::State>>,
-    permit: tokio_sync::semaphore::Permit,
+    lease: Lease<S::State>,
     fut: futures_state_stream::IntoFuture<S>,
 }
 
@@ -78,11 +95,7 @@ impl<S: StateStream> Future for RestoringStateStreamFuture<S> {
             Ok(Async::Ready((StreamEvent::Next(item), stream))) => {
                 Ok(Async::Ready(RestoringStateStream {
                     first: Some(item),
-                    inner: self.inner.clone(),
-                    permit: std::mem::replace(
-                        &mut self.permit,
-                        tokio_sync::semaphore::Permit::new(),
-                    ),
+                    lease: self.lease.transfer(),
                     rest: stream,
                     state: None,
                 }))
@@ -90,11 +103,7 @@ impl<S: StateStream> Future for RestoringStateStreamFuture<S> {
             Ok(Async::Ready((StreamEvent::Done(state), stream))) => {
                 Ok(Async::Ready(RestoringStateStream {
                     first: None,
-                    inner: self.inner.clone(),
-                    permit: std::mem::replace(
-                        &mut self.permit,
-                        tokio_sync::semaphore::Permit::new(),
-                    ),
+                    lease: self.lease.transfer(),
                     rest: stream,
                     state: Some(state),
                 }))
@@ -111,9 +120,11 @@ impl<S: StateStream> Future for RestoringStateStreamFuture<S> {
 
 impl<S: StateStream> RestoringStateStream<S> {
     fn restore_state(&mut self) -> Poll<Option<S::Item>, S::Error> {
-        unsafe { *self.inner.c.get() = self.state.take() };
-        // finally, we can now release the permit since we're done with the connection
-        self.permit.release(&self.inner.s);
+        self.lease.restore(
+            self.state
+                .take()
+                .expect("told to restore state, but don't have state"),
+        );
         return Ok(Async::Ready(None));
     }
 }
@@ -165,8 +176,7 @@ where
             .into_future();
 
         RestoringStateStreamFuture {
-            inner: self.0.inner.clone(),
-            permit: std::mem::replace(&mut self.0.permit, tokio_sync::semaphore::Permit::new()),
+            lease: self.0.transfer(),
             fut,
         }
     }
@@ -199,6 +209,6 @@ impl<'a> tower_service::Service<()> for ConnectionStr<'a> {
     }
 
     fn call(&mut self, _: ()) -> Self::Future {
-        Box::new(SqlConnection::connect(&*self.0).map(|c| Tiberius::from(c)))
+        Box::new(SqlConnection::connect(&*self.0).map(Tiberius::from))
     }
 }
