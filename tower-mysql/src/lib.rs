@@ -1,8 +1,7 @@
 //! A wrapper for [`mysql_async::Conn`] that implements [`tower_service::Service`].
 //!
 //! You can either wrap an existing [`mysql_async::Conn`] using `Mysql::from`, or you can
-//! use the [`ConnectionStr`] or [`Configuration`] service to generate one from a connection string
-//! or configuration respectively.
+//! use the [`Opts`] service to generate one from a configuration.
 
 #![deny(missing_docs)]
 
@@ -86,8 +85,7 @@ impl<S> From<S> for StateInner<S> {
     }
 }
 
-/// This is mainly a [`futures::Stream`]; you should use it as such.
-// TODO: make this private using existentials.
+/// This is mainly a [`mysql_async::QueryResult`]; you should use it as such.
 pub struct QueryResult {
     result: my::QueryResult<Conn, my::BinaryProtocol>,
     lease: Lease<Conn>,
