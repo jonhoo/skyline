@@ -2,4 +2,5 @@
 members = [
 	"tower-tiberius",
 	"tower-mysql",
+	"tower-redis",
 ]
