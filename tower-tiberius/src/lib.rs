@@ -2,6 +2,8 @@
 //!
 //! You can either wrap an existing [`tiberius::SqlConnection`] using `Tiberius::from`, or you can
 //! use the [`ConnectionStr`] service to generate one from a connection string.
+//!
+//! Note that this connection type does _not_ support pipelining.
 
 #![deny(missing_docs)]
 
@@ -202,7 +204,8 @@ impl From<String> for ConnectionStr<'static> {
 impl<'a> tower_service::Service<()> for ConnectionStr<'a> {
     type Response = Tiberius<Box<dyn BoxableIo>>;
     type Error = Error;
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
+    // TODO: existentials
+    type Future = Box<Future<Item = Self::Response, Error = Self::Error> + Send>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
         Ok(Async::Ready(()))

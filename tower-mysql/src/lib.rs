@@ -2,6 +2,8 @@
 //!
 //! You can either wrap an existing [`mysql_async::Conn`] using `Mysql::from`, or you can
 //! use the [`Opts`] service to generate one from a configuration.
+//!
+//! Note that this connection type does _not_ support pipelining.
 
 #![deny(missing_docs)]
 
@@ -196,7 +198,8 @@ impl<'a> From<&'a str> for Opts {
 impl tower_service::Service<()> for Opts {
     type Response = Mysql;
     type Error = my::error::Error;
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
+    // TODO: existentials
+    type Future = Box<Future<Item = Self::Response, Error = Self::Error> + Send>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
         Ok(Async::Ready(()))
