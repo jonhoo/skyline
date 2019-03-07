@@ -104,7 +104,44 @@ impl<S: StateStream> Stream for RestoringStateStream<S> {
     }
 }
 
-impl<I: BoxableIo + 'static, S> tower_service::Service<(S, &[&dyn ty::ToSql])> for Tiberius<I>
+/// This is mainly a [`futures::Future`]; you should use it as such.
+// TODO: make this private using existentials.
+pub struct RestoringStateFuture<S, F> {
+    lease: Lease<S>,
+    fut: F,
+}
+
+impl<T, S, F> Future for RestoringStateFuture<S, F>
+where
+    F: Future<Item = (T, S)>,
+{
+    type Item = T;
+    type Error = F::Error;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.fut.poll() {
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Ok(Async::Ready((item, state))) => {
+                self.lease.restore(state);
+                Ok(Async::Ready(item))
+            }
+            Err(err) => {
+                // We need https://github.com/steffengy/tiberius/issues/75
+                // to be able to restore the connection.
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Arguments to [`tiberius::SqlConnection::query`].
+pub struct Query<'a, S> {
+    /// The query string to execute.
+    pub stmt: S,
+    /// The arguments to query with.
+    pub params: &'a [&'a dyn ty::ToSql],
+}
+
+impl<'a, I: BoxableIo + 'static, S> tower_service::Service<Query<'a, S>> for Tiberius<I>
 where
     S: Into<stmt::Statement>,
 {
@@ -118,10 +155,43 @@ where
         Ok(self.0.poll_acquire())
     }
 
-    fn call(&mut self, (stmt, params): (S, &[&dyn ty::ToSql])) -> Self::Future {
+    fn call(&mut self, Query { stmt, params }: Query<'a, S>) -> Self::Future {
         // we have the lease, since poll_ready must have returned Ok(Ready)
         let fut = self.0.take().query(stmt, params).into_future();
         RestoringStateStreamFuture {
+            lease: self.0.transfer(),
+            fut,
+        }
+    }
+}
+
+/// Arguments to [`tiberius::SqlConnection::exec`].
+pub struct Exec<'a, S> {
+    /// The query string to execute.
+    pub stmt: S,
+    /// The arguments to execute with.
+    pub params: &'a [&'a dyn ty::ToSql],
+}
+
+impl<'a, I: BoxableIo + 'static, S> tower_service::Service<Exec<'a, S>> for Tiberius<I>
+where
+    S: Into<stmt::Statement>,
+{
+    type Response = u64;
+    type Error = <query::QueryStream<I> as Stream>::Error;
+    type Future = RestoringStateFuture<
+        SqlConnection<I>,
+        stmt::ExecResult<stmt::StmtStream<I, query::ExecFuture<I>>>,
+    >;
+
+    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        Ok(self.0.poll_acquire())
+    }
+
+    fn call(&mut self, Exec { stmt, params }: Exec<'a, S>) -> Self::Future {
+        // we have the lease, since poll_ready must have returned Ok(Ready)
+        let fut = self.0.take().exec(stmt, params);
+        RestoringStateFuture {
             lease: self.0.transfer(),
             fut,
         }
