@@ -10,9 +10,8 @@
 use futures::{try_ready, Async, Future, Poll, Stream};
 use futures_state_stream::{StateStream, StreamEvent};
 use std::borrow::Cow;
-use std::cell::UnsafeCell;
-use std::sync::Arc;
 use tiberius::*;
+use tokio_sync::lease::Lease;
 
 /// A Microsoft SQL Server service implementation.
 ///
@@ -22,53 +21,6 @@ pub struct Tiberius<I: BoxableIo>(Lease<SqlConnection<I>>);
 impl<I: BoxableIo> From<SqlConnection<I>> for Tiberius<I> {
     fn from(c: SqlConnection<I>) -> Self {
         Tiberius(Lease::from(c))
-    }
-}
-
-struct Lease<S> {
-    inner: Arc<StateInner<S>>,
-    permit: tokio_sync::semaphore::Permit,
-}
-
-unsafe impl<S> Send for Lease<S> where S: Send + Sync {}
-
-impl<S> From<S> for Lease<S> {
-    fn from(s: S) -> Self {
-        Self {
-            inner: Arc::new(StateInner::from(s)),
-            permit: tokio_sync::semaphore::Permit::new(),
-        }
-    }
-}
-
-impl<S> Lease<S> {
-    fn transfer(&mut self) -> Self {
-        assert!(self.permit.is_acquired());
-        Self {
-            inner: self.inner.clone(),
-            permit: std::mem::replace(&mut self.permit, tokio_sync::semaphore::Permit::new()),
-        }
-    }
-
-    fn restore(&mut self, state: S) {
-        assert!(self.permit.is_acquired());
-        unsafe { *self.inner.c.get() = Some(state) };
-        // finally, we can now release the permit since we're done with the connection
-        self.permit.release(&self.inner.s);
-    }
-}
-
-struct StateInner<S> {
-    c: UnsafeCell<Option<S>>,
-    s: tokio_sync::semaphore::Semaphore,
-}
-
-impl<S> From<S> for StateInner<S> {
-    fn from(s: S) -> Self {
-        StateInner {
-            c: UnsafeCell::new(Some(s)),
-            s: tokio_sync::semaphore::Semaphore::new(1),
-        }
     }
 }
 
@@ -163,20 +115,12 @@ where
         RestoringStateStreamFuture<stmt::QueryResult<stmt::StmtStream<I, query::QueryStream<I>>>>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        self.0.permit.poll_acquire(&self.0.inner.s).map_err(|_| {
-            // the semaphore was closed, but we have a handle to it!
-            unreachable!()
-        })
+        Ok(self.0.poll_acquire())
     }
 
     fn call(&mut self, (stmt, params): (S, &[&dyn ty::ToSql])) -> Self::Future {
-        // we have a permit, since poll_ready must have returned Ok(Ready)
-        let fut = unsafe { &mut *self.0.inner.c.get() }
-            .take()
-            .expect("we got a permit, but the connection wasn't there")
-            .query(stmt, params)
-            .into_future();
-
+        // we have the lease, since poll_ready must have returned Ok(Ready)
+        let fut = self.0.take().query(stmt, params).into_future();
         RestoringStateStreamFuture {
             lease: self.0.transfer(),
             fut,

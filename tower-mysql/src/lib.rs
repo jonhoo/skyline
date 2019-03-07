@@ -10,9 +10,8 @@
 use futures::{Async, Future, Poll};
 use my::{prelude::*, Conn};
 use mysql_async as my;
-use std::cell::UnsafeCell;
-use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::ops::Deref;
+use tokio_sync::lease::Lease;
 
 /// A MySQL service implementation.
 ///
@@ -22,68 +21,6 @@ pub struct Mysql(Lease<Conn>);
 impl From<Conn> for Mysql {
     fn from(c: Conn) -> Self {
         Mysql(Lease::from(c))
-    }
-}
-
-struct Lease<S> {
-    inner: Arc<StateInner<S>>,
-    permit: tokio_sync::semaphore::Permit,
-}
-
-unsafe impl<S> Send for Lease<S> where S: Send + Sync {}
-
-impl<S> From<S> for Lease<S> {
-    fn from(s: S) -> Self {
-        Self {
-            inner: Arc::new(StateInner::from(s)),
-            permit: tokio_sync::semaphore::Permit::new(),
-        }
-    }
-}
-
-impl<S> Lease<S> {
-    fn transfer(&mut self) -> Self {
-        assert!(self.permit.is_acquired());
-        Self {
-            inner: self.inner.clone(),
-            permit: std::mem::replace(&mut self.permit, tokio_sync::semaphore::Permit::new()),
-        }
-    }
-
-    fn restore(&mut self, state: S) {
-        assert!(self.permit.is_acquired());
-        unsafe { *self.inner.c.get() = Some(state) };
-        // finally, we can now release the permit since we're done with the connection
-        self.permit.release(&self.inner.s);
-    }
-}
-
-impl<S> Deref for Lease<S> {
-    type Target = Option<S>;
-    fn deref(&self) -> &Self::Target {
-        assert!(self.permit.is_acquired());
-        unsafe { &*self.inner.c.get() }
-    }
-}
-
-impl<S> DerefMut for Lease<S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        assert!(self.permit.is_acquired());
-        unsafe { &mut *self.inner.c.get() }
-    }
-}
-
-struct StateInner<S> {
-    c: UnsafeCell<Option<S>>,
-    s: tokio_sync::semaphore::Semaphore,
-}
-
-impl<S> From<S> for StateInner<S> {
-    fn from(s: S) -> Self {
-        StateInner {
-            c: UnsafeCell::new(Some(s)),
-            s: tokio_sync::semaphore::Semaphore::new(1),
-        }
     }
 }
 
@@ -154,19 +91,15 @@ where
     type Future = my::BoxFuture<Self::Response>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        self.0.permit.poll_acquire(&self.0.inner.s).map_err(|_| {
-            // the semaphore was closed, but we have a handle to it!
-            unreachable!()
-        })
+        Ok(self.0.poll_acquire())
     }
 
     fn call(&mut self, PrepExec { query, params }: PrepExec<Q, P>) -> Self::Future {
         // we have a permit, since poll_ready must have returned Ok(Ready)
-        let lease = self.0.transfer();
+        let mut lease = self.0.transfer();
         Box::new(
-            self.0
+            lease
                 .take()
-                .expect("we got a permit, but the connection wasn't there")
                 .prep_exec(query, params)
                 .map(move |result| QueryResult { result, lease }),
         )

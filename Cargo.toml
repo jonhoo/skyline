@@ -4,3 +4,6 @@ members = [
 	"tower-mysql",
 	"tower-redis",
 ]
+
+[patch.crates-io]
+tokio-sync = { git = "https://github.com/jonhoo/tokio.git", branch = "tokio-sync-lease" }
