@@ -7,11 +7,11 @@
 
 #![deny(missing_docs)]
 
+use async_lease::Lease;
 use futures::{try_ready, Async, Future, Poll, Stream};
 use futures_state_stream::{StateStream, StreamEvent};
 use std::borrow::Cow;
 use tiberius::*;
-use tokio_sync::lease::Lease;
 
 /// A Microsoft SQL Server service implementation.
 ///

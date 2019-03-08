@@ -7,11 +7,11 @@
 
 #![deny(missing_docs)]
 
+use async_lease::Lease;
 use futures::{Async, Future, Poll};
 use my::{prelude::*, Conn};
 use mysql_async as my;
 use std::ops::Deref;
-use tokio_sync::lease::Lease;
 
 /// A MySQL service implementation.
 ///

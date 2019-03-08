@@ -6,6 +6,6 @@ edition = "2018"
 
 [dependencies]
 futures = "0.1"
-tokio-sync = "0.1"
+async-lease = "0.1"
 tower-service = "0.2"
 mysql_async = "0.17.2"
